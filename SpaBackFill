@@ -1,0 +1,571 @@
+package com.wayfair.partner.account.service.service;
+
+import static com.wayfair.partner.account.service.database.LegalEntityRepository.WAYFAIR_IE_LEGAL_ENTITY;
+import static com.wayfair.partner.account.service.database.LegalEntityRepository.WAYFAIR_US_LEGAL_ENTITY;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.APPROVED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.COMPLETED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.FAILED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.PASSED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.PENDING;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.SIGNED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus.UNINITIATED;
+import static com.wayfair.partner.account.service.database.model.LegalEntityStatusType.KYB;
+import static com.wayfair.partner.account.service.database.model.LegalEntityStatusType.LEGACY_ALLOWANCE_TERMS;
+import static com.wayfair.partner.account.service.database.model.LegalEntityStatusType.LEGACY_PAYMENT_TERMS;
+import static com.wayfair.partner.account.service.database.model.LegalEntityStatusType.PAYMENT_TERMS;
+import static com.wayfair.partner.account.service.database.model.LegalEntityStatusType.SPA;
+
+import com.wayfair.partner.account.service.authorization.UserAuthorizationService;
+import com.wayfair.partner.account.service.database.LegalEntityKycStatusRepository;
+import com.wayfair.partner.account.service.database.LegalEntityRepository;
+import com.wayfair.partner.account.service.database.LegalEntityStatusRepository;
+import com.wayfair.partner.account.service.database.LegalIdentifierRepository;
+import com.wayfair.partner.account.service.database.MergedEntityRepository;
+import com.wayfair.partner.account.service.database.PartnerAddressRepository;
+import com.wayfair.partner.account.service.database.SalesAccountRepository;
+import com.wayfair.partner.account.service.database.model.EntityTypes;
+import com.wayfair.partner.account.service.database.model.LegalEntity;
+import com.wayfair.partner.account.service.database.model.LegalEntityAgreementStatus;
+import com.wayfair.partner.account.service.database.model.LegalEntityKycStatus;
+import com.wayfair.partner.account.service.database.model.LegalEntityStatus;
+import com.wayfair.partner.account.service.database.model.LegalEntityStatusKeys;
+import com.wayfair.partner.account.service.database.model.LegalEntityStatusType;
+import com.wayfair.partner.account.service.database.model.LegalIdentifier;
+import com.wayfair.partner.account.service.database.model.ManualComplianceCheckRequiredStatus;
+import com.wayfair.partner.account.service.database.model.MergedEntity;
+import com.wayfair.partner.account.service.database.model.MergedEntityKeys;
+import com.wayfair.partner.account.service.database.model.PartnerAccount;
+import com.wayfair.partner.account.service.database.model.PartnerAccountStatus;
+import com.wayfair.partner.account.service.database.model.PartnerAccountStatusType;
+import com.wayfair.partner.account.service.database.model.PartnerAddress;
+import com.wayfair.partner.account.service.database.model.SalesAccountEntity;
+import com.wayfair.partner.account.service.events.producer.LegalEntityEventProducer;
+import com.wayfair.partner.account.service.events.producer.PartnerAccountEventProducer;
+import com.wayfair.partner.account.service.exception.PartnerAccountNotFoundException;
+import com.wayfair.partner.account.service.exception.SalesAccountNotFoundException;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedCreateLegalEntityInput;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedUpdateLegalEntityBusinessLocationInput;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedUpdateLegalEntityKycStatusInput;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedUpdateLegalEntityLegalIdentifiersInput;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedUpdateLegalEntityNameInput;
+import com.wayfair.partner.account.service.graphql.validation.legalentity.ValidatedUpdateLegalEntityPlaceOfIncorporationInput;
+import com.wayfair.partner.account.service.helper.APSChecker;
+import com.wayfair.partner.account.service.helper.CountryHelper;
+import com.wayfair.partner.account.service.supplier.migration.events.producer.LegalEntityUpdatedEventProducer;
+import com.wayfair.partner.account.service.util.FeatureToggle;
+import datadog.trace.api.Trace;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import javax.validation.constraints.NotNull;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections.ListUtils;
+import org.apache.commons.lang3.SerializationUtils;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@Transactional
+@RequiredArgsConstructor
+@Slf4j
+public class LegalEntityService {
+  public static final String LEGAL_ENTITY_ASSET = "legalEntityIds";
+  private final LegalEntityRepository legalEntityRepository;
+  private final LegalIdentifierRepository legalIdentifierRepository;
+  private final LegalEntityStatusRepository legalEntityStatusRepository;
+  private final LegalEntityKycStatusRepository legalEntityKycStatusRepository;
+  private final PartnerAddressRepository partnerAddressRepository;
+  private final LegalEntityEventProducer legalEntityEventProducer;
+  private final LegalEntityUpdatedEventProducer legalEntityUpdatedEventProducer;
+  private final SalesAccountRepository salesAccountRepository;
+  private final UserAuthorizationService userAuthorizationService;
+  private final PartnerAccountService partnerAccountService;
+  private final PartnerAccountStatusService partnerAccountStatusService;
+  private final PartnerAccountEventProducer partnerAccountEventProducer;
+  private final FeatureToggle featureToggle;
+  private final MergedEntityRepository mergedEntityRepository;
+
+  private final APSChecker apsChecker;
+
+  @Trace
+  public static Optional<LegalEntity> getWayfairLegalEntityById(final UUID id) {
+    if (id.equals(WAYFAIR_US_LEGAL_ENTITY.getId())) {
+      return Optional.of(WAYFAIR_US_LEGAL_ENTITY);
+    } else if (id.equals(WAYFAIR_IE_LEGAL_ENTITY.getId())) {
+      return Optional.of(WAYFAIR_IE_LEGAL_ENTITY);
+    }
+    return Optional.empty();
+  }
+
+  @Trace
+  public LegalEntity createLegalEntity(final ValidatedCreateLegalEntityInput input,
+                                       @NotNull List<String> userIds,
+                                       boolean isMigration) {
+
+    final boolean partnerAccountHasNoOtherLegalEntities =
+        getLegalEntitiesByPartnerAccountId(input.getPartnerAccount().getId()).isEmpty();
+
+    LegalEntity.LegalEntityBuilder builder = LegalEntity.builder()
+        .name(input.getName())
+        .source(input.getSource())
+        .incorporationCountry(input.getIncorporationCountry())
+        .incorporationRegion(input.getIncorporationRegion())
+        .partnerAccountId(input.getPartnerAccount().getId());
+
+    if (input.getBusinessLocation() != null) {
+      PartnerAddress businessLocation = input.getBusinessLocation();
+      partnerAddressRepository.save(businessLocation);
+      builder.businessLocation(businessLocation);
+    }
+
+    LegalEntity legalEntity = builder.build();
+    LegalEntity savedLegalEntity = legalEntityRepository.save(legalEntity);
+
+    if (featureToggle.isKybEnabled()) {
+      initializeLegalEntityKYBStatus(savedLegalEntity, isMigration);
+    }
+
+    if (input.getLegalIdentifiers() != null) {
+      Set<LegalIdentifier> legalIdentifiers = input.getLegalIdentifiers();
+      legalIdentifiers.forEach(legalIdentifier -> legalIdentifier.setLegalEntityId(legalEntity.getId()));
+      legalEntity.setLegalIdentifiers(legalIdentifiers);
+      legalIdentifierRepository.saveAll(legalIdentifiers);
+    }
+
+    userIds.forEach(userId -> userAuthorizationService.addUserAsset(userId,
+        LEGAL_ENTITY_ASSET,
+        savedLegalEntity.getId().toString()));
+
+    // In case it's not a migration then there should be only one userId.
+    if (!isMigration && userIds.size() == 1) {
+      legalEntityEventProducer.publishCreatedEvent(savedLegalEntity, userIds.get(0),
+          isAPSSupplier(input.getPartnerAccount().getId(), savedLegalEntity, userIds.get(0)));
+    }
+
+
+    if (partnerAccountHasNoOtherLegalEntities && !isMigration) {
+      publishPartnerAccountManualComplianceCheckRequirementUpdatedEvent(savedLegalEntity);
+    }
+    return legalEntity;
+  }
+
+  private boolean isAPSSupplier(UUID partnerAccountId, LegalEntity legalEntity, String userId) {
+    Optional<PartnerAccount> partnerAccount = partnerAccountService.getPartnerAccountById(partnerAccountId);
+    return apsChecker.isAPSCheckRequired(legalEntity,
+        partnerAccount.orElseThrow(() -> new PartnerAccountNotFoundException(
+            "Could not find partner account when creating the legal entity")), userId);
+  }
+
+  @Trace
+  public LegalEntity updateLegalEntity(final ValidatedCreateLegalEntityInput input,
+                                       @NotNull List<String> userIds,
+                                       boolean isMigration,
+                                       UUID legalEntityId) {
+
+    LegalEntity legalEntity = getLegalEntityByIdOrFail(legalEntityId);
+    final LegalEntity previous = getLegalEntityByIdOrFail(legalEntityId);
+
+    legalEntity.setName(input.getName());
+    legalEntity.setIncorporationCountry(input.getIncorporationCountry());
+    legalEntity.setIncorporationRegion(input.getIncorporationRegion());
+    legalEntity.setPartnerAccountId(input.getPartnerAccount().getId());
+
+    PartnerAddress businessLocation = input.getBusinessLocation();
+    if (businessLocation == null) {
+      legalEntity.setBusinessLocation(null);
+    } else {
+      if (previous.getBusinessLocation() != null) {
+        businessLocation.setId(previous.getBusinessLocation().getId());
+      }
+      PartnerAddress partnerAddress = partnerAddressRepository.save(businessLocation);
+      legalEntity.setBusinessLocation(partnerAddress);
+    }
+
+    LegalEntity savedLegalEntity = legalEntityRepository.save(legalEntity);
+
+    if (featureToggle.isKybEnabled()) {
+      initializeLegalEntityKYBStatus(savedLegalEntity, isMigration);
+    }
+
+    if (input.getLegalIdentifiers() != null) {
+      savedLegalEntity.getLegalIdentifiers().clear();
+      Set<LegalIdentifier> legalIdentifiers = input.getLegalIdentifiers();
+      legalIdentifiers.forEach(legalIdentifier -> legalIdentifier.setLegalEntityId(legalEntity.getId()));
+      savedLegalEntity.getLegalIdentifiers().addAll(legalIdentifiers);
+      legalIdentifierRepository.saveAll(legalIdentifiers);
+    }
+
+    userIds.forEach(userId -> userAuthorizationService.addUserAsset(userId,
+        LEGAL_ENTITY_ASSET, savedLegalEntity.getId().toString()));
+
+    legalEntityUpdatedEventProducer.publishLegalEntityUpdatedEvent(legalEntity, previous);
+
+    return legalEntity;
+  }
+
+  private void initializeLegalEntityKYBStatus(final LegalEntity savedLegalEntity, final boolean isMigration) {
+    log.info("Initializing kyb status for legalEntity={}", savedLegalEntity.getId());
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(savedLegalEntity.getId()).statusType(KYB).build();
+    LegalEntityStatus legalEntityStatus = LegalEntityStatus.builder().keys(key).status(isMigration ? PASSED : UNINITIATED).build();
+    legalEntityStatusRepository.save(legalEntityStatus);
+  }
+
+  private void publishPartnerAccountManualComplianceCheckRequirementUpdatedEvent(LegalEntity legalEntity) {
+
+    UUID partnerAccountId = legalEntity.getPartnerAccountId();
+
+    Optional<PartnerAccount> partnerAccount = partnerAccountService.getPartnerAccountById(partnerAccountId);
+    if (partnerAccount.isEmpty()) {
+      throw new PartnerAccountNotFoundException("Partner account " + partnerAccountId + " was not found");
+    }
+    ManualComplianceCheckRequiredStatus previousStatus = partnerAccount
+        .map(PartnerAccount::getManualComplianceCheckRequired)
+        .orElse(ManualComplianceCheckRequiredStatus.PENDING);
+
+    ManualComplianceCheckRequiredStatus currentStatus =
+        previousStatus == ManualComplianceCheckRequiredStatus.REQUIRED
+            ? ManualComplianceCheckRequiredStatus.REQUIRED
+            : ManualComplianceCheckRequiredStatus.PENDING;
+
+    partnerAccount.ifPresent(
+        partnerAccountResult -> partnerAccountService.updateManualComplianceCheckRequirement(partnerAccountResult,
+            currentStatus));
+    partnerAccountEventProducer.publishPartnerAccountManualCheckRequirementUpdatedEvent(partnerAccountId,
+        previousStatus, currentStatus);
+
+  }
+
+  @Trace
+  public List<LegalEntity> getLegalEntitiesByPartnerAccountId(UUID partnerAccountId) {
+    return legalEntityRepository.findByPartnerAccountId(partnerAccountId);
+  }
+
+  @Trace
+  public Map<UUID, List<LegalEntity>> getLegalEntitiesByPartnerAccountIds(List<UUID> partnerAccountIds) {
+    List<LegalEntity> legalEntities = legalEntityRepository.findByPartnerAccountIdIn(partnerAccountIds);
+    Map<UUID, List<LegalEntity>> legalEntityMap = legalEntities.stream().collect(Collectors.groupingBy(LegalEntity::getPartnerAccountId));
+    partnerAccountIds.forEach(partnerAccountId -> legalEntityMap.putIfAbsent(partnerAccountId, List.of()));
+
+    return legalEntityMap;
+  }
+
+  @Trace
+  public Map<UUID, LegalEntity> getLegalEntitiesBySalesAccountIds(List<UUID> salesAccountIds) {
+    List<SalesAccountEntity> salesAccounts = salesAccountRepository.findAllById(salesAccountIds);
+    List<UUID> legalEntityIds = salesAccounts.stream().map(SalesAccountEntity::getPartnerLegalEntityId).collect(Collectors.toList());
+    List<LegalEntity> legalEntities = legalEntityRepository.findAllById(legalEntityIds);
+    Map<UUID, LegalEntity> legalEntityByIdMap = legalEntities.stream().collect(Collectors.toMap(LegalEntity::getId, Function.identity()));
+
+    return salesAccounts.stream()
+        .collect(Collectors.toMap(SalesAccountEntity::getId, salesAccount -> legalEntityByIdMap.get(salesAccount.getPartnerLegalEntityId())));
+  }
+
+  @Trace
+  public Optional<LegalEntity> getLegalEntityById(UUID id) {
+    return legalEntityRepository.findById(id);
+  }
+
+  @Trace
+  public LegalEntity getLegalEntityByIdOrFail(UUID id) {
+    return getLegalEntityById(id).orElseThrow(() -> new RuntimeException("Legal entity " + id + " was not found"));
+  }
+
+  @Trace
+  public Map<UUID, List<LegalIdentifier>> getLegalIdentifiers(List<UUID> legalEntityIds) {
+    List<LegalIdentifier> legalIdentifiers = legalIdentifierRepository.findByLegalEntityIdIn(legalEntityIds);
+    Map<UUID, List<LegalIdentifier>> legalIdentifierMap = legalIdentifiers.stream().collect(Collectors.groupingBy(LegalIdentifier::getLegalEntityId));
+    legalEntityIds.forEach(legalEntityId -> legalIdentifierMap.putIfAbsent(legalEntityId, List.of()));
+
+    return legalIdentifierMap;
+  }
+
+  @Trace
+  public LegalEntity updateLegalEntityName(ValidatedUpdateLegalEntityNameInput input, String userId) {
+    LegalEntity legalEntity = getLegalEntityByIdOrFail(input.getId());
+    String previousName = legalEntity.getName();
+    legalEntity.setName(input.getName());
+    var savedLegalEntity = legalEntityRepository.save(legalEntity);
+    legalEntityEventProducer.publishNameUpdatedEvent(savedLegalEntity, previousName,
+        isAPSSupplier(savedLegalEntity.getPartnerAccountId(), savedLegalEntity, userId));
+    return legalEntity;
+  }
+
+  @Trace
+  public LegalEntity updateLegalEntityPlaceOfIncorporation(ValidatedUpdateLegalEntityPlaceOfIncorporationInput input, String userId) {
+    final LegalEntity legalEntity = getLegalEntityByIdOrFail(input.getId());
+    final String previousCountry = legalEntity.getIncorporationCountry();
+    final String previousRegion = legalEntity.getIncorporationRegion();
+
+    legalEntity.setIncorporationCountry(input.getIncorporationCountry());
+    legalEntity.setIncorporationRegion(input.getIncorporationRegion());
+    legalEntityRepository.save(legalEntity);
+    legalEntityEventProducer.publishPlaceOfIncorporationUpdatedEvent(legalEntity, previousCountry, previousRegion,
+        isAPSSupplier(legalEntity.getPartnerAccountId(), legalEntity, userId));
+    return legalEntity;
+  }
+
+  @Trace
+  public void updateAgreementStatus(UUID salesAccountId, LegalEntityAgreementStatus status) {
+    UUID legalEntityId = getLegalEntityId(salesAccountId);
+
+    updateAgreementStatusForLegalEntity(status, legalEntityId);
+  }
+
+  public void updateAgreementStatusForLegalEntity(LegalEntityAgreementStatus status, UUID legalEntityId) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(SPA).build();
+
+    LegalEntityStatus entity = LegalEntityStatus.builder().keys(key).status(status).build();
+    legalEntityStatusRepository.save(entity);
+  }
+
+  public void updatePaymentTermsStatus(UUID salesAccountId, LegalEntityAgreementStatus paymentTermsStatus,
+                                       LegalEntityStatusType statusType) {
+    UUID legalEntityId = getLegalEntityId(salesAccountId);
+
+    updatePaymentTermsStatus(paymentTermsStatus, statusType, legalEntityId);
+  }
+
+  public void updatePaymentTermsStatus(LegalEntityAgreementStatus paymentTermsStatus, LegalEntityStatusType statusType,
+                                       UUID legalEntityId) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(statusType).build();
+    LegalEntityStatus entity = LegalEntityStatus.builder().keys(key).status(paymentTermsStatus).build();
+    legalEntityStatusRepository.save(entity);
+  }
+
+  public void updateKYBStatus(UUID legalEntityId, LegalEntityAgreementStatus kybStatus) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(KYB).build();
+    LegalEntityStatus entity = LegalEntityStatus.builder().keys(key).status(kybStatus).build();
+    legalEntityStatusRepository.save(entity);
+  }
+
+  @Trace
+  public LegalEntity updateLegalEntityBusinessLocation(ValidatedUpdateLegalEntityBusinessLocationInput input, String userId) {
+    LegalEntity legalEntity = getLegalEntityByIdOrFail(input.getId());
+    PartnerAddress businessLocation = input.getBusinessLocation();
+
+    PartnerAddress previousLocation = null;
+
+    if (legalEntity.getBusinessLocation() != null) {
+      previousLocation = PartnerAddress.builder()
+          .line1(legalEntity.getBusinessLocation().getLine1())
+          .line2(legalEntity.getBusinessLocation().getLine2())
+          .line3(legalEntity.getBusinessLocation().getLine3())
+          .postalCode(legalEntity.getBusinessLocation().getPostalCode())
+          .city(legalEntity.getBusinessLocation().getCity())
+          .state(legalEntity.getBusinessLocation().getState())
+          .countryCode(legalEntity.getBusinessLocation().getCountryCode())
+          .build();
+      businessLocation.setId(legalEntity.getBusinessLocation().getId());
+      partnerAddressRepository.save(businessLocation);
+    } else {
+      partnerAddressRepository.save(businessLocation);
+      legalEntity.setBusinessLocation(businessLocation);
+      legalEntityRepository.save(legalEntity);
+    }
+
+    legalEntityEventProducer.publishBusinessLocationUpdatedEvent(legalEntity, previousLocation,
+        isAPSSupplier(legalEntity.getPartnerAccountId(), legalEntity, userId));
+
+    return legalEntity;
+  }
+
+  @Trace
+  public void updateLegalEntityLegalIdentifiers(ValidatedUpdateLegalEntityLegalIdentifiersInput input, String userId) {
+    input.getLegalIdentifiers().forEach(legalIdentifier -> legalIdentifier.setLegalEntityId(input.getId()));
+    legalEntityRepository.findById(input.getId()).ifPresent(legalEntity -> {
+      final Set<LegalIdentifier> previousLegalIdentifiers = new HashSet<>(legalEntity.getLegalIdentifiers());
+      legalEntity.getLegalIdentifiers().clear();
+      legalEntity.getLegalIdentifiers().addAll(input.getLegalIdentifiers());
+      legalEntityRepository.save(legalEntity);
+      legalEntityEventProducer.publishLegalIdentifiersUpdatedEvent(legalEntity, previousLegalIdentifiers,
+          isAPSSupplier(legalEntity.getPartnerAccountId(), legalEntity, userId));
+    });
+  }
+
+  public Optional<LegalEntity> getWayfairLegalEntityByCountries(List<String> countries) {
+    String wayfairLegalEntityRegionCountryCode = "";
+    if (CountryHelper.areValidNaCountries(countries) || CountryHelper.isCountryAustralia(countries)) {
+      wayfairLegalEntityRegionCountryCode = CountryHelper.US;
+    } else if (CountryHelper.areValidEuCountries(countries)) {
+      wayfairLegalEntityRegionCountryCode = CountryHelper.IE;
+    }
+    return getWayfairLegalEntityByCountry(wayfairLegalEntityRegionCountryCode);
+  }
+
+  private Optional<LegalEntity> getWayfairLegalEntityByCountry(String countryCode) {
+    if (countryCode.equals(CountryHelper.US)) {
+      return Optional.of(WAYFAIR_US_LEGAL_ENTITY);
+    } else if (countryCode.equals(CountryHelper.IE)) {
+      return Optional.of(WAYFAIR_IE_LEGAL_ENTITY);
+    }
+    return Optional.empty();
+  }
+
+  @Trace
+  public boolean hasSignedAgreement(UUID salesAccountId) {
+    UUID legalEntityId = getLegalEntityId(salesAccountId);
+
+    return isAgreementSigned(legalEntityId);
+  }
+
+  @Trace
+  public boolean isAgreementSigned(UUID legalEntityId) {
+
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(SPA).build();
+    return legalEntityStatusRepository.findByKeysAndStatus(key, SIGNED).isPresent()
+        || legalEntityStatusRepository.findByKeysAndStatus(key, COMPLETED).isPresent()
+        || legalEntityStatusRepository.findByKeysAndStatus(key, APPROVED).isPresent();
+  }
+
+  @Trace
+  public boolean hasCompletedPaymentTerms(UUID salesAccountId) {
+    UUID legalEntityId = getLegalEntityId(salesAccountId);
+    boolean isPaymentTermsCompleted = arePaymentTermsCompleted(legalEntityId);
+    boolean isPaymentTermsEdocCompleted = arePaymentTermsEdocCompleted(legalEntityId);
+    boolean isAllowanceTermsEdocCompleted = areAllowanceTermsEdocCompleted(legalEntityId);
+    return (isPaymentTermsCompleted || (isPaymentTermsEdocCompleted && isAllowanceTermsEdocCompleted));
+  }
+
+  private boolean areAllowanceTermsEdocCompleted(UUID legalEntityId) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(LEGACY_ALLOWANCE_TERMS).build();
+
+    return legalEntityStatusRepository.findByKeysAndStatus(key, LegalEntityAgreementStatus.COMPLETED).isPresent();
+  }
+
+  private boolean arePaymentTermsEdocCompleted(UUID legalEntityId) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(LEGACY_PAYMENT_TERMS).build();
+
+    return legalEntityStatusRepository.findByKeysAndStatus(key, LegalEntityAgreementStatus.COMPLETED).isPresent();
+  }
+
+  @Trace
+  public boolean arePaymentTermsCompleted(UUID legalEntityId) {
+
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(PAYMENT_TERMS).build();
+
+    return legalEntityStatusRepository.findByKeysAndStatus(key, LegalEntityAgreementStatus.COMPLETED).isPresent();
+  }
+
+  @Trace
+  private UUID getLegalEntityId(UUID salesAccountId) {
+    return salesAccountRepository.findById(salesAccountId)
+        .map(SalesAccountEntity::getPartnerLegalEntityId)
+        .orElseThrow(SalesAccountNotFoundException::new);
+  }
+
+  //KYB Status check
+  @Trace
+  public boolean isKYBComplaint(UUID salesAccountId) {
+    log.info("Checking KYB compliance for salesAccountId={}", salesAccountId);
+    UUID legalEntityId = getLegalEntityId(salesAccountId);
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(KYB).build();
+    Optional<LegalEntityStatus> legalEntityStatus = legalEntityStatusRepository.findByKeys(key);
+    legalEntityStatus
+        .ifPresentOrElse(legalEntityStatus1 -> log.info("kyb status={} for salesAccountId={} legalEntityId={}",
+                legalEntityStatus1.getStatus(), salesAccountId, legalEntityId),
+            () -> log.info("No kyb status found for salesAccountId={} legalEntityId={}", salesAccountId, legalEntityId));
+    return legalEntityStatus.isPresent() && legalEntityStatus.get().getStatus() != UNINITIATED
+        && legalEntityStatus.get().getStatus() != PENDING
+        && legalEntityStatus.get().getStatus() != FAILED;
+  }
+
+  @Trace
+  public void updateLegalEntityStatus(
+      UUID legalEntityId, LegalEntityAgreementStatus status, LegalEntityStatusType type) {
+    LegalEntityStatusKeys key = LegalEntityStatusKeys.builder().legalEntityId(legalEntityId).statusType(type).build();
+    LegalEntityStatus entity = LegalEntityStatus.builder().keys(key).status(status).build();
+    legalEntityStatusRepository.save(entity);
+  }
+
+  @Trace
+  public void updatePartnerAccountId(UUID partnerLegalEntityId, UUID newPartnerAccountId) {
+    LegalEntity legalEntity = getLegalEntityByIdOrFail(partnerLegalEntityId);
+    UUID previousPartnerAccountId = legalEntity.getPartnerAccountId();
+    legalEntity.setPartnerAccountId(newPartnerAccountId);
+    legalEntityRepository.save(legalEntity);
+    mergedEntityRepository.save(MergedEntity.builder()
+        .keys(MergedEntityKeys.builder()
+            .entityId(partnerLegalEntityId).entityType(EntityTypes.LEGAL_ENTITY).build())
+        .previousPartnerAccountId(previousPartnerAccountId)
+        .currentPartnerAccountId(newPartnerAccountId)
+        .build());
+  }
+
+  public Page<LegalEntity> getLegalEntityByName(String name, int page, int size) {
+    return legalEntityRepository.findByName(name, PageRequest.of(page, size));
+  }
+
+  @Trace
+  public Map<UUID, PartnerAddress> getPartnerAddressesByLegalEntityIds(List<UUID> legalEntityIds) {
+    Map<UUID, UUID> partnerAddressMap = legalEntityRepository.findAddressIdByLegalEntityId(legalEntityIds).stream()
+        .collect(Collectors.toMap(pair -> pair.first, pair -> pair.second));
+    Map<UUID, PartnerAddress> addressMap = partnerAddressRepository.findAllById(partnerAddressMap.keySet()).stream()
+        .collect(Collectors.toMap(partnerAddress -> partnerAddressMap.get(partnerAddress.getId()), Function.identity()));
+    legalEntityIds.forEach(legalEntityId -> addressMap.putIfAbsent(legalEntityId, null));
+    return addressMap;
+  }
+
+  @Trace
+  public void updateKYCStatus(UUID legalEntityId, LegalEntityAgreementStatus kycStatus) {
+
+    Optional<LegalEntityKycStatus> existingEntityOptional = legalEntityKycStatusRepository.findByLegalEntityId(legalEntityId);
+
+    if (existingEntityOptional.isPresent()) {
+      LegalEntityKycStatus existingEntity = existingEntityOptional.get();
+      existingEntity.setStatus(kycStatus);
+      legalEntityKycStatusRepository.save(existingEntity);
+    } else {
+      LegalEntityKycStatus entity = LegalEntityKycStatus
+          .builder()
+          .legalEntityId(legalEntityId)
+          .status(kycStatus).build();
+      legalEntityKycStatusRepository.save(entity);
+    }
+
+  }
+
+  public LegalEntity updateKYCStatus(ValidatedUpdateLegalEntityKycStatusInput validatedInput) {
+    updateKYCStatus(validatedInput.getLegalEntityId(), validatedInput.getStatus());
+    return getLegalEntityByIdOrFail(validatedInput.getLegalEntityId());
+  }
+
+  @Trace
+  public List<LegalEntityKycStatus> getKycStatusByLegalEntityId(List<UUID> legalEntityIds) {
+    return legalEntityKycStatusRepository.findByLegalEntityIdIn(legalEntityIds);
+  }
+
+  @Trace
+  public Optional<LegalEntityKycStatus> getKycStatusByLegalEntityId(UUID legalEntityId) {
+    return getKycStatusByLegalEntityId(List.of(legalEntityId)).stream().findFirst();
+  }
+
+  @Trace
+  public List<LegalEntityKycStatus> getKycStatusByLegalEntityIdWithDefaultValueOnMissing(List<UUID> legalEntityIds) {
+    List<LegalEntityKycStatus> existingLegalEntityKycStatuses = getKycStatusByLegalEntityId(legalEntityIds);
+    List<LegalEntityKycStatus> missingLegalEntityKycStatuses =
+        legalEntityIds.stream()
+            .filter(id -> !existingLegalEntityKycStatuses.stream().map(v -> v.getLegalEntityId()).collect(Collectors.toList()).contains(id))
+            .map(nonExistingId -> LegalEntityKycStatus.builder()
+                .legalEntityId(nonExistingId)
+                .status(LegalEntityAgreementStatus.MISSING).build())
+            .collect(Collectors.toList());
+
+    return ListUtils.union(existingLegalEntityKycStatuses, missingLegalEntityKycStatuses);
+  }
+
+  @Trace
+  public void updateManualComplianceCheck(UUID legalEntityId, String status) {
+    PartnerAccount partnerAccount = partnerAccountService.getPartnerAccountByLegalEntityId(legalEntityId);
+    partnerAccountStatusService.updateStatus(partnerAccount,
+        PartnerAccountStatusType.MANUAL_COMPLIANCE_CHECK, PartnerAccountStatus.valueOf(status));
+  }
+
+}
