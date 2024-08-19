@@ -1,0 +1,172 @@
+    
+import com.netflix.graphql.dgs.client.CustomGraphQLClient;
+import com.netflix.graphql.dgs.client.GraphQLClient;
+import com.netflix.graphql.dgs.client.GraphQLResponse;
+import com.netflix.graphql.dgs.client.HttpResponse;
+import com.opencsv.CSVWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.*;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.http.HttpStatus;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.reactive.function.client.WebClient;
+import static reactor.core.publisher.Mono.just;
+public class GetDuplicateLegalEntity {
+    private final WebClient webClient;
+    private final String URL ="https://admin.wayfair.com/federation/chaos/service-to-service";
+    String csvFilePath = "result_9.csv";
+    String csvFilePathSame = "result_s9.csv";
+
+
+    private final String QUERY = "query {\n" +
+            "    partnerAccount {\n" +
+            "     partnerAccountsAll(pageSize: %d, page: %d) {\n" +
+            "      pageInfo {\n" +
+            "       currentPage\n" +
+            "       hasNextPage\n" +
+            "       hasPreviousPage\n" +
+            "      }\n" +
+            "      nodes {\n   " +
+            "        partnerAccountId  "+
+            "       legalEntities {\n" +
+            "          legalEntityId\n" +
+            "          name\n" +
+            "          salesAccounts {\n" +
+            "            salesAccountId" +
+            "          }  " +
+            "        placeOfIncorporation {\n" +
+            "          countryCode\n" +
+            "          region\n" +
+            "        }\n" +
+            "        } " +
+            "       }\n" +
+            "     }\n" +
+            "    }\n" +
+            "   }";
+    public GetDuplicateLegalEntity() {
+        this.webClient = WebClient.builder()
+                .baseUrl(URL)
+                .build();
+    }
+    public void getLegalEntities(int page , int pagesize){
+        var res= executeQuery(String.format(QUERY ,pagesize ,page ),getHeaders(),getVaribales(page,pagesize));
+        findDuplicates(res);
+        boolean hasNextPage =
+                res.extractValue("partnerAccount.partnerAccountsAll.pageInfo.hasNextPage");
+        if( hasNextPage  && page < 901 ){
+            getLegalEntities(++page,pagesize);
+        }
+    }
+    private void findDuplicates(GraphQLResponse res) {
+        List<LinkedHashMap> partnerAccountList = res.extractValue("partnerAccount.partnerAccountsAll.nodes");
+        for (Map account : partnerAccountList) {
+            List<LinkedHashMap> legalEntities= (List<LinkedHashMap>) account.get("legalEntities");
+            String partnerAccountId = (String) account.get("partnerAccountId");
+            HashMap<String,String> duplicateEntity = new HashMap<>();
+            for (Map legalEntity : legalEntities) {
+                String name = (String) legalEntity.get("name");
+                StringBuilder salesAccountId= new StringBuilder();
+                List<LinkedHashMap> salesAccounts = (List<LinkedHashMap>) legalEntity.get("salesAccounts");
+                LinkedHashMap place = (LinkedHashMap) legalEntity.get("placeOfIncorporation");
+                for (Map salesAccount : salesAccounts) {
+                    salesAccountId.append((String) salesAccount.get("salesAccountId")).append(",");
+                }
+                if(!duplicateEntity.containsKey(name)){
+                    String value ="";
+                    if(place == null){
+                         value = salesAccountId+":" +(String) legalEntity.get("legalEntityId");
+                    }else {
+                        value = salesAccountId+":" +(String) legalEntity.get("legalEntityId")+":"+place.get("countryCode")+":"+place.get("region");
+                    }
+
+                    duplicateEntity.put( name, value);
+                }else {
+                    String value = duplicateEntity.get(name);
+                    List<String> array =  Arrays.asList(value.split(":"));
+                    String id = array.get(1);
+                    String saId = array.get(0);
+                    String country = "";
+                    if(array.size() >2){
+                         country = array.get(2);
+                    }
+                    String region = "";
+                    if(array.size() >3){
+                         region = array.get(3);
+                    }
+
+
+                    if( place==null || !country.equals(place.get("countryCode")) || !region.equals(place.get("region"))){
+                        writeToCSV(new String[]{partnerAccountId, (String) legalEntity.get("legalEntityId"), name, salesAccountId.toString(),
+                                place==null? "":(String) place.get("countryCode"),place==null? "":(String) place.get("region") },true);
+                        writeToCSV(new String[]{partnerAccountId, id, name, saId,country,region},true);
+                    }else{
+                        writeToCSVSame(new String[]{partnerAccountId, (String) legalEntity.get("legalEntityId"), name, salesAccountId.toString(),
+                                (String) place.get("countryCode"),(String) place.get("region") },true);
+                        writeToCSVSame(new String[]{partnerAccountId, id, name, saId,country,region},true);
+                    }
+
+                }
+            }
+        }
+    }
+    private void writeToCSV(String[] data, boolean append) {
+        try (CSVWriter writer = new CSVWriter(new FileWriter(csvFilePath, append))) {
+            writer.writeNext(data);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void writeToCSVSame(String[] data, boolean append) {
+        try (CSVWriter writer = new CSVWriter(new FileWriter(csvFilePathSame, append))) {
+            writer.writeNext(data);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    @NotNull
+    private static MultiValueMap<String, String> getHeaders() {
+        MultiValueMap<String, String> requestHeaders= new LinkedMultiValueMap<>();
+        requestHeaders.put("Accept", Collections.singletonList("application/json"));
+        requestHeaders.put("Accept-Encoding", Collections.singletonList("gzip"));
+        requestHeaders.put("Content-Type", Collections.singletonList("application/json"));
+        requestHeaders.put("apollographql-client-name", Collections.singletonList("apollo-sudio"));
+        requestHeaders.put("apollographql-client-version", Collections.singletonList("prod-service-to-service"));
+        requestHeaders.put("Authorization", Collections.singletonList("Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InBlRG5BMWVVVGRVQU00YVdjU3FnZm40ZEJhbFZCYnJ4R2ZEU0ZQYXVQbG8iLCJ0eXAiOiJKV1QiLCJ4NXQiOiItOHlqSGM0VE9meThMYVU3b2pUSWdZN3VaSlUiLCJqa3UiOiJodHRwczovL3Nzby5hdXRoLndheWZhaXIuY29tLy53ZWxsLWtub3duL29wZW5pZC1jb25maWd1cmF0aW9uL2p3a3MifQ.eyJuYmYiOjE3MjM2MTkxMTUsImV4cCI6MTcyMzcwNTUxNiwiaWF0IjoxNzIzNjE5MTE2LCJpc3MiOiJodHRwczovL3Nzby5hdXRoLndheWZhaXIuY29tLyIsImF1ZCI6WyJhdXRoX2lkZW50aXR5IiwiY29tcGxpYW5jZS1iYXJyaWVycy1tYW5hZ2VyIiwiY29tcGxpYW5jZS1yZXN0cmljdGlvbnMiLCJjb21wbGlhbmNlLXJ1bGUtbWFuYWdlciIsImNvbXBsaWFuY2Utc2Nhbi1vcmNoZXN0cmF0b3IiLCJsZWdhY3ktc3VwcGxpZXItZW50aXRpZXMtYWRhcHRlciIsInBhcnRuZXItYWNjb3VudC1zZXJ2aWNlIiwicGgtcGF5bWVudHMtYW5kLXRlcm1zLWZzbSIsInNhZS1jb21wbGlhbmNlLWt5Yi1saXZlLXN1cHBsaWVyLWV4cCIsInN1cHBsaWVyLWNyZWF0aW9uLW9yY2hlc3RyYXRvciIsInN1cHBsaWVyLXN5bmNocm9uaXNlci1zZXJ2aWNlIl0sImNsaWVudF9pZCI6IjVPdW05YnJDSDl3V0N6VmMteTJQWGciLCJjbGllbnRfbHJwcyI6IjEwMDAiLCJjbGllbnRfbmFtZSI6IktZQiBtaWxlc3RvbmVfNCIsInN1YiI6IjVPdW05YnJDSDl3V0N6VmMteTJQWGdAY2xpZW50cyIsImp0aSI6IjdENTgzQTYwNzY2QkY4OTM0MzQ5RTNFQkQ2RDBGRjgxIiwic2NvcGUiOiJhdXRoLndheWZhaXIuY29tOmNsaWVudF9yZWFkIGNvbXBsaWFuY2UtYmFycmllcnMtbWFuYWdlcjpkZWZhdWx0X3Njb3BlIGNvbXBsaWFuY2UtcmVzdHJpY3Rpb25zOmRlZmF1bHRfc2NvcGUgY29tcGxpYW5jZS1ydWxlLW1hbmFnZXI6ZGVmYXVsdF9zY29wZSBjb21wbGlhbmNlLXNjYW4tb3JjaGVzdHJhdG9yOmRlZmF1bHRfc2NvcGUgbGVnYWN5LXN1cHBsaWVyLWVudGl0aWVzLWFkYXB0ZXI6cmVhZCBsZWdhY3ktc3VwcGxpZXItZW50aXRpZXMtYWRhcHRlcjp3cml0ZSBwYXJ0bmVyLWFjY291bnQtc2VydmljZTphZG1pbiBwYXJ0bmVyLWFjY291bnQtc2VydmljZTphdXRoel9zY29wZSBwYXJ0bmVyLWFjY291bnQtc2VydmljZTpkZWZhdWx0X3Njb3BlIHBoLXBheW1lbnRzLWFuZC10ZXJtcy1mc206ZGVmYXVsdF9zY29wZSBzYWUtY29tcGxpYW5jZS1reWItbGl2ZS1zdXBwbGllci1leHA6ZGVmYXVsdF9zY29wZSBzdXBwbGllci1jcmVhdGlvbi1vcmNoZXN0cmF0b3I6ZGVmYXVsdF9zY29wZSBzdXBwbGllci1zeW5jaHJvbmlzZXItc2VydmljZTpkZWZhdWx0X3Njb3BlIn0.ivQgrcqrI_tenJj22Ffs4ayj0KtJtZvg3WxTUZtoeVts34MxYEdv1bhm-ytiaY1yY63zpmG-4ihexsXjp__GwoawAy_OlqbzL5K-igErk2a_qRc74OAaJOGJdH3V_tZNchaqcAXsxbSU0mjkz3MfEEEXk00ZdcVDHVT5Kysq79TTN-hX3u9F-39xpnQ0BvBA8nE2riLOREDvRLqt_YemXwWZcb7_AvVz43Y5LkEkGr-y2RXiRiMGzhaCFO_cHfzLFWmbIei-w8SZaTOShKuTyldlixxm2iomPilR06_AUuaQ1OVSHi8V5rsBI-keLY6vqv2Ma-loheZK9EFGon5UN87_5UoCTFBq_CElp5q_Da-DN-h4qTUFsfEB7MZMHWpfM90uGAJBTs0G9Yd1tKqmqjhZ_l9sbCEbIBE4ix0RhjTPh_sBkYjRhNfh6ozpynfACTDU0TLZkbat6r2Xlicpvf1h9vYzLfYMjWJoA8Z5RVcy34LanoLktCouGqnsvyDa_KWbZJmDRBy9LyYD1ZN1vR0KacKCucVNwI015aE8xJnzEm5c-o6Xde1ClAXHNzCj5L4EIvZsp3N0KZkp7DCIcsytr7wso9yte1w7IdI_kfV4B_EVXE8fBzODdrBLRUk_Qj-FHPJvkbA83kTW2fWMRmO-5MeeijPcPsZHF4501fw"));
+        return requestHeaders;
+    }
+    @NotNull
+    private static Map<String, String> getVaribales(int page , int pagesize) {
+        Map<String, String> variables = new HashMap<>();
+        variables.put("page",String.valueOf(page));
+        variables.put("pageSize",String.valueOf(pagesize));
+        return variables;
+    }
+    public GraphQLResponse executeQuery(String query,MultiValueMap<String, String> requestHeaders, Map<String, String> variables) {
+        GraphQLClient graphQLClient = new CustomGraphQLClient("/graphql", (url, headers, body) -> {
+            try {
+                String responseBody = webClient.post()
+                        .uri(url)
+                        .headers(h -> h.addAll(requestHeaders))
+                        .body(just(body), String.class)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .timeout(Duration.ofMillis(5000000))
+                        .block();
+                return new HttpResponse(HttpStatus.OK.value(), responseBody);
+            } catch (Exception exception) {
+                throw exception;
+            }
+        });
+        return graphQLClient.executeQuery(query, variables);
+    }
+    public static void main(String[] args) {
+        GetDuplicateLegalEntity ref= new GetDuplicateLegalEntity();
+         ref.writeToCSV(new String[]{"PartnerAccountId", "legalEntityId" , "legalEntityName", "SalesAccountId","Country","Region"},false);
+         ref.writeToCSVSame(new String[]{"PartnerAccountId", "legalEntityId" , "legalEntityName", "SalesAccountId","Country","Region"},false);
+        ref.getLegalEntities(801,100);
+    }
+}
